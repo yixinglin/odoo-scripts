@@ -1,7 +1,7 @@
 import dotenv
 import pandas as pd
 
-from rest import OdooAPIKey, OdooWarehouseOperation
+from rest import OdooAPIKey, OdooWarehouseOperation, OdooPricelistOperation
 
 # 调整显示选项
 pd.set_option('display.max_columns', None)  # 显示所有列
@@ -10,7 +10,7 @@ pd.set_option('display.width', 1000)  # 增加总宽度
 
 env_path = "conf/.env"
 dotenv.load_dotenv(env_path)
-key = OdooAPIKey.test()
+key = OdooAPIKey.prod()
 
 """
 Export
@@ -47,9 +47,14 @@ def relocate_quant_by_putaway_rules():
     operation.relocate_quants_to_putaway_location(stock_to_move)
     print("Done")
 
+def update_pricelist_items():
+    operation = OdooPricelistOperation(key, debug=True)
+    operation.update_price_list_item()
+    print("Done")
 
 
 if __name__ == '__main__':
     # show_warehouse_quants()
-    show_product()
+    # show_product()
     # relocate_quant_by_putaway_rules()
+    update_pricelist_items()

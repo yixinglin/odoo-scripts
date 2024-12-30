@@ -1,10 +1,11 @@
 import json
 import os
+import re
 import time
 import xmlrpc.client
 from copy import copy
 from datetime import datetime
-from typing import List
+from typing import List, Union
 import pandas as pd
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -538,3 +539,300 @@ class OdooWarehouseOperation:
         return product_vo_list
 
 
+class PricelistItem(BaseModel):
+    id: int
+    pricelist_id: int
+    pricelist_name: str
+    company_id: int
+    company_name: str
+    fixed_price: float
+    name: str
+    currency: str
+    min_quantity: int
+    product_tmpl_id: int
+    product_tmpl_name: str
+    default_code: str
+    product_id: Union[int, None]
+    product_name: Union[str, None]
+
+# --------------- #
+# 核心类及方法定义 #
+# --------------- #
+class OdooPricelistOperation:
+    def __init__(self, api_key: 'OdooAPIKey', debug: bool = False):
+        """
+        :param api_key: OdooAPIKey 对象，用于认证和连接 Odoo
+        :param debug: 是否处于调试模式。若为 True 则不会实际执行写入/创建操作
+        """
+        self.product_templ_client = ProductTemplateClient(api_key, login=True)
+        self.client = self.product_templ_client.client
+        self.debug = debug
+
+    # ----------------------- #
+    #  主入口：更新价格表条目  #
+    # ----------------------- #
+    def update_price_list_item(self) -> List[str]:
+        """
+        从本地读取 VIP 价格表数据，与 Odoo 中的价格表做对比，创建或更新对应的 price_list_item。
+        :return: 未能在 Odoo 找到对应product template 的 internal_reference 列表
+        """
+        # 1. 读取 & 预处理 VIP 数据
+        input("请确认VIP价格表数据已经保存到 temp/vip_price.json，然后按任意键继续...")
+        df_vip_prices = self._load_and_preprocess_vip_data('temp/vip_price.json')
+
+        # 2. 获取所有在VIP中的价格表名称
+        vip_pricelist_names = df_vip_prices['group_name'].unique().tolist()
+        print(f"[VIP] Total number of groups: {len(vip_pricelist_names)}")
+        for i, name in enumerate(vip_pricelist_names, start=1):
+            print(f"{i}. {name}")
+        input("请确认VIP价格表名称，然后按任意键继续...")
+
+        # 3. 从Odoo读取这些价格表信息
+        pricelist_details = self._get_odoo_pricelist_details(vip_pricelist_names)
+        vip_pricelist_names_in_odoo = [pl['name'] for pl in pricelist_details]
+        vip_pricelist_names_not_in_odoo = [name for name in vip_pricelist_names if name not in vip_pricelist_names_in_odoo]
+
+        print(f"VIP pricelist names in Odoo: {len(vip_pricelist_names_in_odoo)}")
+        print(f"VIP pricelist names not in Odoo: {len(vip_pricelist_names_not_in_odoo)}")
+        for i, name in enumerate(vip_pricelist_names_not_in_odoo, start=1):
+            print(f"\t{i}. {name}")
+        input("请确认以上价格表名称，然后按任意键继续...")
+
+        # 4. 获取 Odoo pricelist item 与 product.template 信息
+        pricelist_items = self._get_odoo_pricelist_items(vip_pricelist_names_in_odoo)
+        product_templates_map = self._get_odoo_product_templates()
+
+        # 5. 对比 VIP 与 Odoo 数据，并输出对比结果
+        df_compare = self._compare_vip_and_odoo_pricelist(df_vip_prices, pricelist_items, vip_pricelist_names_in_odoo)
+        df_compare.to_excel('temp/vip_odoo_pricelist_items.xlsx', index=False)
+        print(f"文件已经保存到 temp/vip_odoo_pricelist_items.xlsx")
+        input("请检查文件内容，确认无误后按任意键继续...")
+
+        # 6. 更新 & 创建 Pricelist item
+        print(f"注意: 以下操作将会改变Odoo数据库，请确认是否执行！！！！！！！")
+        confirmed = input("确认请输入Y，否则请按任意键退出...")
+        if confirmed.lower() != 'y':
+            print("操作已取消，退出...")
+            return []
+
+        products_not_found = []
+        products_not_found += self._update_pricelist_items(df_compare)
+        products_not_found += self._create_pricelist_items(df_compare, product_templates_map, pricelist_details)
+
+        print(f"Total number of products not found: {len(products_not_found)}")
+        print(products_not_found)
+        return products_not_found
+
+    # ------------------------------- #
+    #         私有方法: 读取VIP数据    #
+    # ------------------------------- #
+    def _load_and_preprocess_vip_data(self, file_path: str) -> pd.DataFrame:
+        """从指定JSON文件加载数据，并做字段预处理，返回DataFrame。"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)['data']
+
+        df = pd.DataFrame.from_dict(data)
+        # 正则匹配 article_number => (internal_reference, size)
+        pattern = r"^(.*?)(PK\d+)$"
+
+        df['internal_reference'] = df['article_number'].str.extract(pattern, expand=False)[0]
+        df['sales_units'] = df['article_number'].str.extract(pattern, expand=False)[1].str.replace('PK', '')
+        df['internal_reference'] = df['internal_reference'].fillna(df['article_number'])
+        df['sales_units'] = df['sales_units'].fillna(1)
+
+        # 数量转为 int，并据此折算单价
+        df['min_quantity'] = df['sales_units'].astype(int)
+        df['custom_price'] = df['custom_price'] / df['min_quantity']
+        df['std_price_a'] = df['std_price_a'] / df['min_quantity']
+        df['std_price_b'] = df['std_price_b'] / df['min_quantity']
+
+        # 构造 key 方便后续 merge
+        df.drop(columns=['article_number'], inplace=True)
+        df['key'] = df['group_name'] + '_' + df['internal_reference'].astype(str)
+
+        # 排序 & 重置索引
+        df.sort_values(by='group_name', inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    # --------------------------------------------------- #
+    #    私有方法: 获取Odoo中已有的 pricelist 相关信息      #
+    # --------------------------------------------------- #
+    def _get_odoo_pricelist_details(self, vip_pricelist_names: List[str]) -> List[dict]:
+        """从Odoo 'product.pricelist' 获取指定名称的价格表详细信息。"""
+        domain = [('name', 'in', [name.strip() for name in vip_pricelist_names])]
+        pricelist_ids = self.client.search('product.pricelist', [domain], {})
+        pricelist_details = self.client.read('product.pricelist', [pricelist_ids],
+                                            {'fields': ['id', 'name', 'active']})
+        print(f"[Odoo] Found {len(pricelist_details)} matching pricelists in Odoo.")
+        return pricelist_details
+
+    def _get_odoo_pricelist_items(self, pricelist_names_in_odoo: List[str]) -> List[PricelistItem]:
+        """
+        从 Odoo 中拉取指定价格表的 pricelist.item 列表，转换为 PricelistItem 对象列表。
+        :return: PricelistItem 对象列表
+        """
+        if not pricelist_names_in_odoo:
+            print("[Odoo] No pricelist to retrieve items from.")
+            return []
+
+        domain = [('name', 'in', pricelist_names_in_odoo)]
+        fields = ["id", "company_id", "pricelist_id", "fixed_price", "name", "currency_id",
+                  "min_quantity", "product_tmpl_id", "product_id"]
+        pricelist_item_data = self.client.search_read('product.pricelist.item', [domain], {"fields": fields})
+        print(f"[Odoo] Found {len(pricelist_item_data)} pricelist items in Odoo.")
+
+        pricelist_items: List[PricelistItem] = []
+        for item in pricelist_item_data:
+            # 从 product_tmpl_id 名称中提取 [default_code]
+            product_tmpl_label = item['product_tmpl_id'][1] if item['product_tmpl_id'] else ''
+            match = re.search(r'\[(.*?)\]', product_tmpl_label)
+            default_code = match.group(1) if match else ""
+
+            # 组装 PricelistItem 对象
+            pricelist_items.append(PricelistItem(
+                id=item['id'],
+                pricelist_id=item['pricelist_id'][0],
+                pricelist_name=item['pricelist_id'][1].replace('(EUR)', '').strip(),
+                company_id=item['company_id'][0],
+                company_name=item['company_id'][1],
+                fixed_price=item['fixed_price'],
+                name=item['name'],
+                currency=item['currency_id'][1],
+                min_quantity=item['min_quantity'],
+                product_tmpl_id=item['product_tmpl_id'][0] if item['product_tmpl_id'] else 0,
+                product_tmpl_name=product_tmpl_label,
+                default_code=default_code,
+                product_id=item['product_id'][0] if item['product_id'] else None,
+                product_name=item['product_id'][1] if item['product_id'] else None
+            ))
+        return pricelist_items
+
+    def _get_odoo_product_templates(self) -> dict:
+        """
+        从 Odoo 读取所有激活的 product.template，并返回 {default_code: product_template_dict} 映射。
+        """
+        domain = [('active', '=', True)]
+        product_templates = self.client.search_read('product.template', [domain],
+                                                    {'fields': ['id', 'name', 'default_code']})
+        print(f"[Odoo] Found {len(product_templates)} active product templates.")
+        return {pt['default_code']: pt for pt in product_templates if pt['default_code']}
+
+    # -------------------------------------------------- #
+    #    私有方法: 对比VIP与Odoo数据，标记 create/update    #
+    # -------------------------------------------------- #
+    def _compare_vip_and_odoo_pricelist(
+        self,
+        df_vip_prices: pd.DataFrame,
+        pricelist_items: List[PricelistItem],
+        pricelist_names_in_odoo: List[str],
+    ) -> pd.DataFrame:
+        """
+        将 VIP 的价格表信息与 Odoo 中的 pricelist item 合并对比，
+        标记出需要 create 的行和需要 update 的行。
+        :return: 结果 DataFrame，含 'action' 列（create/update）
+        """
+        # 先把 Odoo item 转成 DF
+        df_odoo_pricelist_items = pd.DataFrame.from_records(
+            [item.model_dump() for item in pricelist_items]
+        )
+        df_odoo_pricelist_items['key'] = (
+            df_odoo_pricelist_items['pricelist_name']
+            + '_'
+            + df_odoo_pricelist_items['default_code']
+        )
+
+        # 内连接: key
+        df_merged = df_vip_prices.merge(df_odoo_pricelist_items, on='key', how='left', suffixes=('_vip','_odoo'))
+
+        # 只保留那些在 Odoo 中确实存在的 pricelist
+        df_filtered = df_merged[df_merged['group_name'].isin(pricelist_names_in_odoo)].copy()
+
+        # 标记 action: 如果 pricelist_id（来自 Odoo）为空 => create，否则 update
+        df_filtered['action'] = df_filtered['pricelist_id'].isna().map({True: 'create', False: 'update'})
+
+        return df_filtered
+
+    # -------------------------------------------------- #
+    #            私有方法: 更新已有的pricelist.item       #
+    # -------------------------------------------------- #
+    def _update_pricelist_items(self, df_compare: pd.DataFrame) -> List[str]:
+        """
+        对于已存在的 pricelist item，更新其 fixed_price, min_quantity 等。
+        :return: 未找到产品列表（此处一般不会新增此列表，仅占位）
+        """
+        df_update = df_compare[df_compare['action'] == 'update'].copy()
+        print(f"[Update] Number of pricelist items to update: {len(df_update)}")
+
+        for i, row in enumerate(df_update.itertuples(), start=1):
+            pricelist_item_id = int(row.id) if pd.notna(row.id) else None
+            if not pricelist_item_id:
+                continue  # 无效行（一般不会发生）
+
+            update_vals = {
+                'fixed_price': row.custom_price,
+                'min_quantity': row.min_quantity_vip,
+                'compute_price': 'fixed',
+            }
+            print(f"{i}. Updating pricelist item ID={pricelist_item_id} in {row.group_name}")
+            print(f"    => {update_vals}")
+
+            if not self.debug:
+                self.client.write('product.pricelist.item', [[pricelist_item_id], update_vals])
+                time.sleep(0.2)
+        return []  # 该步骤不产生products_not_found
+
+    # -------------------------------------------------- #
+    #            私有方法: 创建新的pricelist.item         #
+    # -------------------------------------------------- #
+    def _create_pricelist_items(
+        self,
+        df_compare: pd.DataFrame,
+        product_templates_map: dict,
+        pricelist_details: List[dict]
+    ) -> List[str]:
+        """
+        对于在Odoo中尚不存在的 pricelist item 行，执行创建操作。
+        :param df_compare: 包含了 action='create' 的行
+        :param product_templates_map: {default_code: {id, name, default_code}}
+        :param pricelist_details: Odoo pricelist信息，供 name->id 的映射
+        :return: 未能找到 product.template 的 default_code 列表
+        """
+        df_create = df_compare[df_compare['action'] == 'create'].copy()
+        print(f"[Create] Number of pricelist items to create: {len(df_create)}")
+
+        # 建立 pricelist name -> pricelist_id 映射
+        name_to_pricelist_obj = {detail['name']: detail for detail in pricelist_details}
+        not_found_products = []
+
+        for i, row in enumerate(df_create.itertuples(), start=1):
+            ref_code = row.internal_reference
+            group_name = row.group_name
+            try:
+                product_tmpl_obj = product_templates_map[ref_code]
+            except KeyError:
+                print(f"[Warning] Product template not found for '{ref_code}'")
+                not_found_products.append(ref_code)
+                continue
+
+            pricelist_obj = name_to_pricelist_obj.get(group_name)
+            if not pricelist_obj:
+                print(f"[Warning] Pricelist not found in Odoo for '{group_name}'")
+                continue
+
+            new_item_vals = {
+                'pricelist_id': pricelist_obj['id'],
+                'product_tmpl_id': product_tmpl_obj['id'],
+                'fixed_price': row.custom_price,
+                'min_quantity': row.min_quantity_vip,
+                'compute_price': 'fixed',
+            }
+
+            print(f"{i}. Creating item in Pricelist: {group_name} for product [{ref_code}]")
+            print(f"    => {new_item_vals}")
+
+            if not self.debug:
+                self.client.create('product.pricelist.item', [new_item_vals])
+                time.sleep(0.2)
+
+        return not_found_products

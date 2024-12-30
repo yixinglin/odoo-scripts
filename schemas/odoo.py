@@ -42,3 +42,4 @@ class ProductVO(BaseModel):
     write_date: str
     active: bool
     qty_available: float
+
