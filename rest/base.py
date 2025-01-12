@@ -36,7 +36,7 @@ class OdooAPIKey(BaseModel):
         index = int(os.getenv("ODOO_ACCESS_KEY_INDEX"))
         key_path = os.getenv("ODOO_ACCESS_KEY")
         with open(f"conf/{key_path}", "r") as f:
-            conf = json.load(f)['keys'][0]
+            conf = json.load(f)['keys'][index]
             key = cls(**conf)
         return key
 
