@@ -63,9 +63,9 @@ class OdooClient(object):
 
     def login(self):
         print("Odoo API Login")
-        self.common = xmlrpc.client.ServerProxy('{}/xmlrpc/2/common'.format(self.host))
+        self.common = xmlrpc.client.ServerProxy('{}/xmlrpc/2/common'.format(self.host), allow_none=True)
         self.uid = self.common.authenticate(self.db, self.username, self.password, {})
-        self.models = xmlrpc.client.ServerProxy('{}/xmlrpc/2/object'.format(self.host))
+        self.models = xmlrpc.client.ServerProxy('{}/xmlrpc/2/object'.format(self.host), allow_none=True)
         return self
 
     def version(self):
